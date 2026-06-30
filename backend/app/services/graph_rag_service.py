@@ -53,7 +53,6 @@ class YouMedGraphRAGService:
         try:
             chain_result = self.cypher_chain.invoke({"query": question})
             cypher = extract_cypher(chain_result)
-            rows = normalize_rows(chain_result.get("result", []))
 
             if not cypher:
                 return self._empty_result(question, error="empty_cypher_from_chain")
@@ -62,7 +61,10 @@ class YouMedGraphRAGService:
             if repaired_cypher != cypher:
                 logger.info("Repaired invalid kind in Cypher")
                 cypher = repaired_cypher
-                rows = self.run_cypher_readonly(cypher)
+
+            # Không lấy rows từ chain_result nữa.
+            # Chạy lại Cypher trực tiếp để đảm bảo lấy raw rows từ Neo4j.
+            rows = self.run_cypher_readonly(cypher)
 
             return {
                 "question": question,
@@ -72,6 +74,7 @@ class YouMedGraphRAGService:
                 "answer": "",
                 "error": None,
             }
+
         except Exception as exc:
             logger.exception("Graph query failed")
             return self._empty_result(question, error=repr(exc))
