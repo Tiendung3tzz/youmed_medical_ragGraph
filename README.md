@@ -1,12 +1,13 @@
 # YouMed RAGGraph Fullstack
 
-Ứng dụng chatbot GraphRAG y tế tiếng Việt sử dụng **React + FastAPI + Neo4j + LLM**. Giao diện frontend mô phỏng cách dùng của ChatGPT, backend nhận câu hỏi tiếng Việt, sinh Cypher, truy vấn Neo4j và tạo câu trả lời dựa trên dữ liệu graph.
+Project chatbot y tế tiếng Việt dùng **React + FastAPI + Neo4j + Qdrant + LLM**.
 
-Project này được tách thành ba phần rõ ràng:
+Hệ thống có 2 luồng hỏi đáp:
 
-1. **Runtime chat app**: frontend React và backend FastAPI để người dùng hỏi đáp.
-2. **DB builder**: code tạo schema và import dữ liệu vào Neo4j, chạy riêng khi cần build lại graph.
-3. **Evaluation**: code đánh giá Cypher, retrieval, ranking và answer, chạy riêng trong VS Code hoặc terminal.
+1. **Cypher mode**: LLM sinh Cypher, truy vấn Neo4j, sau đó LLM viết câu trả lời.
+2. **Hybrid mode**: Qdrant semantic search lấy `section_id`, Neo4j enrich node liên quan, sau đó LLM viết câu trả lời.
+
+Hybrid mode là luồng khuyến nghị dùng mặc định vì giảm lỗi LLM sinh sai Cypher.
 
 ---
 
@@ -14,29 +15,41 @@ Project này được tách thành ba phần rõ ràng:
 
 ```text
 User
-  |
-  v
+  ↓
 React Chat UI
-  |
-  | POST /api/chat
-  v
+  ↓
 FastAPI Backend
-  |
-  | 1. LLM sinh Cypher từ câu hỏi
-  | 2. Validate Cypher read-only
-  | 3. Query Neo4j
-  | 4. LLM tổng hợp answer từ rows
-  v
-Neo4j / Neo4j Aura
+  ↓
+Qdrant semantic search
+  ↓
+section_id
+  ↓
+Neo4j enrich Section / Concept / Article / Relation
+  ↓
+LLM answer from evidence rows
 ```
 
-Luồng chính:
+Luồng hybrid:
 
 ```text
-Question -> GraphCypherQAChain -> Cypher -> Neo4j rows -> Answer prompt -> Final answer
+Question
+  -> Embed question
+  -> Search Qdrant collection youmed_sections
+  -> Get section_id list
+  -> Query Neo4j by section_id
+  -> Return evidence rows
+  -> LLM generates final Vietnamese answer
 ```
 
-Backend không hardcode API key. Tất cả key và connection string lấy từ `.env`.
+Luồng Cypher cũ vẫn được giữ lại:
+
+```text
+Question
+  -> GraphCypherQAChain
+  -> LLM-generated Cypher
+  -> Neo4j rows
+  -> LLM answer
+```
 
 ---
 
@@ -46,21 +59,16 @@ Backend không hardcode API key. Tất cả key và connection string lấy từ
 youmed_raggraph_fullstack/
   docker-compose.yml
   README.md
-  README_HUONG_DAN.md
-
-  frontend/
-    src/
-      App.tsx
-      components/
-      lib/api.ts
-      types/chat.ts
-      styles.css
-    package.json
-    Dockerfile
-    nginx.conf
-    .env.example
+  README_QDRANT.md
 
   backend/
+    .env.example
+    Dockerfile
+    requirements.txt
+    data/
+      youmed_articles.jsonl
+      youmed_graph_test_cases_100.json
+
     app/
       main.py
       api/
@@ -82,206 +90,272 @@ youmed_raggraph_fullstack/
         graph_rag_service.py
         cypher_utils.py
         dependencies.py
+      vector/
+        embedding_service.py
+        qdrant_store.py
 
     tools/
       db_builder/
-        importer.py
         run_import.py
+        importer.py
         check_db.py
         clear_db.py
         schema.cypher
-        text_utils.py
+      qdrant/
+        build_section_index.py
+        check_qdrant.py
       eval/
-        youmed_graphrag_evaluator.py
         run_graph_eval.py
+        youmed_graphrag_evaluator.py
 
-    data/
-      sample_youmed_articles.jsonl
-
-    requirements.txt
+  frontend/
     Dockerfile
-    .env.example
+    package.json
+    nginx.conf
+    src/
+      App.tsx
+      components/
+      lib/api.ts
+      types/chat.ts
+      styles.css
 ```
 
 ---
 
 ## 3. Thành phần chính
 
-### 3.1 Frontend React
+### 3.1 Frontend
 
-Frontend là giao diện chat:
+Frontend là React + Vite, giao diện chat đơn giản.
 
-- Sidebar danh sách hội thoại.
-- Khung chat user / assistant.
-- Ô nhập câu hỏi ở dưới.
-- Loading typing dots.
-- Hiển thị answer.
-- Có thể mở rộng để xem Cypher và evidence rows.
-
-File chính:
+File quan trọng:
 
 ```text
 frontend/src/App.tsx
-frontend/src/components/ChatMessage.tsx
-frontend/src/components/ChatInput.tsx
 frontend/src/lib/api.ts
+frontend/src/components/ChatMessage.tsx
+frontend/src/types/chat.ts
 ```
 
-Frontend gọi backend qua biến môi trường:
+Mặc định UI gọi:
 
-```env
-VITE_API_BASE_URL=http://localhost:8000
+```text
+POST /api/chat/hybrid
 ```
 
 ---
 
-### 3.2 Backend FastAPI
+### 3.2 Backend
 
-Backend cung cấp API chat:
+Backend dùng FastAPI.
 
-```http
-POST /api/chat
-POST /api/chat/graph
-GET  /health
-```
-
-Class chính:
-
-```python
-YouMedGraphRAGService
-```
-
-File:
+File chính:
 
 ```text
 backend/app/services/graph_rag_service.py
 ```
 
-Nhiệm vụ:
+Service này xử lý:
 
-1. Nhận câu hỏi.
-2. Sinh Cypher bằng LLM.
-3. Làm sạch và validate Cypher.
-4. Chạy query Neo4j.
-5. Tạo answer cuối từ rows.
-6. Trả về answer, cypher, rows, row_count, error.
-
----
-
-### 3.3 Neo4j / Neo4j Aura
-
-Project chạy được với cả Neo4j local và Neo4j Aura.
-
-Với Neo4j Aura, dùng URI dạng:
-
-```env
-NEO4J_URI=neo4j+s://xxxxxxxx.databases.neo4j.io
-NEO4J_USERNAME=neo4j
-NEO4J_PASSWORD=your_aura_password
-NEO4J_DATABASE=neo4j
+```text
+- ask_graph()              : graph-only Cypher mode
+- ask_graph_with_answer()  : Cypher mode + final answer
+- ask_hybrid()             : Qdrant -> Neo4j -> LLM answer
 ```
 
-Với Neo4j local trong Docker:
+API chính:
 
-```env
-NEO4J_URI=bolt://neo4j:7687
-NEO4J_USERNAME=neo4j
-NEO4J_PASSWORD=your_password
-NEO4J_DATABASE=neo4j
+```text
+GET  /health
+GET  /api/health
+POST /api/chat
+POST /api/chat/graph
+POST /api/chat/hybrid
 ```
 
 ---
 
-### 3.4 DB Builder
+### 3.3 Neo4j
 
-Phần tạo DB được tách riêng trong:
+Neo4j lưu knowledge graph y tế.
 
-```text
-backend/tools/db_builder/
-```
-
-Các file chính:
+Các node chính:
 
 ```text
-importer.py       # class import dữ liệu JSONL vào Neo4j
-run_import.py     # script chạy import
-check_db.py       # script kiểm tra số lượng node/relationship
-clear_db.py       # script xóa dữ liệu graph
-schema.cypher     # constraint/index/schema gợi ý
+Article
+Section
+Concept
+Category
+HeadingType
+ClinicalTerm
 ```
 
-Phần này không bắt buộc chạy khi start app. Chỉ dùng khi muốn build lại graph hoặc nạp thêm dữ liệu.
+Các relationship chính:
+
+```text
+Article -[:HAS_SECTION]-> Section
+Article -[:IN_CATEGORY]-> Category
+Article -[:HAS_TOPIC]-> Concept
+Concept -[:HAS_OVERVIEW_SECTION]-> Section
+Concept -[:HAS_DOSAGE_SECTION]-> Section
+Concept -[:HAS_SIDE_EFFECT_SECTION]-> Section
+Concept -[:HAS_FUNCTION_SECTION]-> Section
+Section -[:HAS_EXTRACTED_TERM]-> ClinicalTerm
+Section -[:NEXT_SECTION]-> Section
+```
 
 ---
 
-### 3.5 Evaluation
+### 3.4 Qdrant
 
-Phần eval được tách riêng trong:
+Qdrant lưu vector của từng `Section`.
 
-```text
-backend/tools/eval/
+Mỗi point trong Qdrant tương ứng với một `Section` trong Neo4j.
+
+Payload mẫu:
+
+```json
+{
+  "section_id": "8809366ef038e68e886eedfd759e397284e20dcf",
+  "heading": "DNA là gì?",
+  "text": "...",
+  "article_id": "...",
+  "article": "...",
+  "category": "...",
+  "concepts": [
+    {
+      "name": "dna",
+      "displayName": "DNA",
+      "kind": "BodyPart",
+      "relation": "HAS_OVERVIEW_SECTION"
+    }
+  ]
+}
 ```
 
-Các file chính:
-
-```text
-youmed_graphrag_evaluator.py
-run_graph_eval.py
-```
-
-Evaluator dùng để chấm:
-
-- Cypher có sinh đúng không.
-- Query có read-only không.
-- Có dùng đúng relationship không.
-- Rows có trả đúng `section_id` gold không.
-- Có hit@k, recall@k, MRR, MAP, NDCG.
-- Có chấm answer bằng string check, ROUGE, token F1 hoặc LLM judge.
-
-Phần này chỉ phục vụ kiểm thử, không cần đưa vào luồng runtime chat.
+Qdrant không thay thế Neo4j. Qdrant chỉ tìm semantic section tốt hơn, còn Neo4j vẫn dùng để enrich graph context.
 
 ---
 
-## 4. Cấu hình môi trường backend
+## 4. Cấu hình môi trường
 
-Tạo file `.env` từ mẫu:
+Tạo file backend env:
 
 ```bash
 cd backend
 cp .env.example .env
 ```
 
-Ví dụ cấu hình dùng Groq + Neo4j Aura:
+Ví dụ `.env` dùng Neo4j Aura + Qdrant local Docker:
 
 ```env
-APP_NAME=YouMed RAGGraph API
-APP_ENV=development
-APP_HOST=0.0.0.0
-APP_PORT=8000
+APP_ENV=dev
+DEBUG=false
+FRONTEND_ORIGINS=http://localhost:5173,http://localhost:3000,http://localhost
 
-FRONTEND_ORIGINS=http://localhost:5173,http://localhost:3000
-
-LLM_PROVIDER=groq
-GROQ_API_KEY=your_groq_api_key
-GROQ_MODEL=meta-llama/llama-4-scout-17b-16e-instruct
-LLM_TEMPERATURE=0
-
-NEO4J_URI=neo4j+s://xxxxxxxx.databases.neo4j.io
+# Neo4j Aura
+NEO4J_URI=neo4j+s://xxxxx.databases.neo4j.io
 NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=your_neo4j_password
 NEO4J_DATABASE=neo4j
+ENHANCED_SCHEMA=true
 
+# LLM
+LLM_PROVIDER=groq
+GROQ_API_KEY=your_groq_api_key
+GROQ_MODEL=meta-llama/llama-4-scout-17b-16e-instruct
+GOOGLE_API_KEY=
+GOOGLE_MODEL=gemini-2.5-flash
+LLM_TEMPERATURE=0.0
+LLM_MAX_TOKENS=1024
+
+# GraphRAG
 GRAPH_TOP_K=10
-RETURN_DIRECT=true
+ANSWER_MAX_ROWS=5
+ANSWER_MAX_TEXT_CHARS=900
+
+# Qdrant local Docker
+QDRANT_URL=http://qdrant:6333
+QDRANT_API_KEY=
+QDRANT_COLLECTION=youmed_sections
+QDRANT_TOP_K=10
+QDRANT_SCORE_THRESHOLD=0
+QDRANT_TIMEOUT=30
+EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5
 ```
 
-Không commit `.env` lên Git.
+Nếu chạy backend local ngoài Docker, đổi:
+
+```env
+QDRANT_URL=http://localhost:6333
+```
+
+Nếu dùng Qdrant Cloud:
+
+```env
+QDRANT_URL=https://xxxxx.region.cloud.qdrant.io
+QDRANT_API_KEY=your_qdrant_api_key
+```
+
+Không commit `.env` thật lên Git.
 
 ---
 
-## 5. Chạy local không dùng Docker
+## 5. Chạy bằng Docker
 
-### 5.1 Chạy backend
+Từ root project:
+
+```bash
+docker compose down --remove-orphans
+docker compose build --no-cache backend frontend
+docker compose up backend frontend qdrant
+```
+
+Sau khi chạy:
+
+```text
+Frontend: http://localhost:3000
+Backend:  http://localhost:8000
+Qdrant:   http://localhost:6333
+```
+
+Kiểm tra backend:
+
+```bash
+curl http://localhost:8000/health
+curl http://localhost:8000/api/health
+```
+
+Kiểm tra backend đang đọc Neo4j URI nào:
+
+```bash
+docker compose exec backend python -c "from app.core.config import get_settings; s=get_settings(); print(s.neo4j_uri); print(s.neo4j_database)"
+```
+
+Nếu dùng Neo4j Aura, kết quả phải là dạng:
+
+```text
+neo4j+s://xxxxx.databases.neo4j.io
+neo4j
+```
+
+---
+
+## 6. Chạy local không dùng Docker
+
+### 6.1 Chạy Qdrant local
+
+Dùng Docker chỉ cho Qdrant:
+
+```bash
+docker run -p 6333:6333 -v qdrant_storage:/qdrant/storage qdrant/qdrant:v1.12.6
+```
+
+Hoặc dùng Qdrant Cloud và bỏ bước này.
+
+---
+
+### 6.2 Chạy backend
 
 ```bash
 cd backend
@@ -312,24 +386,17 @@ Chạy API:
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Kiểm tra:
-
-```bash
-curl http://localhost:8000/health
-```
-
 ---
 
-### 5.2 Chạy frontend
+### 6.3 Chạy frontend
 
 ```bash
 cd frontend
-cp .env.example .env
 npm install
 npm run dev
 ```
 
-Mở trình duyệt:
+Mở:
 
 ```text
 http://localhost:5173
@@ -337,90 +404,31 @@ http://localhost:5173
 
 ---
 
-## 6. Chạy bằng Docker
+## 7. Import dữ liệu vào Neo4j
 
-Tạo `.env` cho backend trước:
+Nếu Neo4j đã có graph sẵn thì bỏ qua bước này.
 
-```bash
-cd backend
-cp .env.example .env
-```
-
-Điền key và Neo4j connection vào `.env`.
-
-Quay lại root project:
-
-```bash
-cd ..
-docker compose up --build
-```
-
-Sau khi chạy:
-
-```text
-Frontend: http://localhost:5173
-Backend:  http://localhost:8000
-Neo4j:    http://localhost:7474 nếu dùng Neo4j local container
-```
-
-Nếu dùng Neo4j Aura, không cần chạy service Neo4j local. Có thể chạy riêng:
-
-```bash
-docker compose up --build backend frontend
-```
-
----
-
-## 7. Tạo hoặc import dữ liệu Neo4j
-
-### 7.1 Import sample data
+### 7.1 Import data mẫu
 
 ```bash
 cd backend
-python -m tools.db_builder.run_import \
-  --data data/sample_youmed_articles.jsonl \
-  --reset \
-  --out import_report.json
+python -m tools.db_builder.run_import --data data/youmed_articles.jsonl --reset --batch-size 200 --out import_report.json
 ```
 
-`--reset` sẽ xóa dữ liệu graph hiện tại trước khi import. Không dùng trên database thật nếu chưa backup.
+Cảnh báo: `--reset` sẽ xóa dữ liệu graph hiện tại trước khi import.
 
 ---
 
-### 7.2 Import file JSONL thật
-
-```bash
-cd backend
-python -m tools.db_builder.run_import \
-  --data /path/to/youmed_articles.jsonl \
-  --batch-size 500 \
-  --out import_report.json
-```
-
-Nếu muốn xóa dữ liệu cũ trước khi import:
-
-```bash
-python -m tools.db_builder.run_import \
-  --data /path/to/youmed_articles.jsonl \
-  --reset \
-  --batch-size 500 \
-  --out import_report.json
-```
-
----
-
-### 7.3 Check dữ liệu
+### 7.2 Check graph
 
 ```bash
 cd backend
 python -m tools.db_builder.check_db
 ```
 
-Script sẽ in số lượng node/relationship để kiểm tra import có thành công không.
-
 ---
 
-### 7.4 Clear dữ liệu
+### 7.3 Clear graph
 
 ```bash
 cd backend
@@ -431,70 +439,75 @@ Chỉ chạy khi chắc chắn muốn xóa graph.
 
 ---
 
-## 8. Chạy eval
+## 8. Build Qdrant index từ Neo4j
 
-Chuẩn bị file testcase, ví dụ:
+Sau khi Neo4j đã có dữ liệu, build Qdrant collection:
 
-```text
-youmed_graph_eval_cases_100.json
+```bash
+docker compose exec backend python -m tools.qdrant.build_section_index --reset --report qdrant_section_index_report.json
 ```
 
-Chạy graph eval:
+Nếu chạy backend local:
 
 ```bash
 cd backend
-python -m tools.eval.run_graph_eval \
-  --cases /path/to/youmed_graph_eval_cases_100.json \
-  --limit 20 \
-  --results graph_results_20.json \
-  --report graph_eval_report_20.json
+python -m tools.qdrant.build_section_index --reset --report qdrant_section_index_report.json
 ```
 
-Kết quả gồm:
+Script này sẽ:
 
 ```text
-pass_overall_rate
-pass_cypher_rate
-pass_retrieval_rate
-pass_answer_rate
-hit_at_1 / hit_at_3 / hit_at_5 / hit_at_10
-recall_at_1 / recall_at_3 / recall_at_5 / recall_at_10
+1. Đọc Section từ Neo4j.
+2. Lấy thêm Article / Concept / relation.
+3. Tạo embedding cho từng Section.
+4. Upsert vector + payload vào Qdrant collection.
 ```
 
-Lưu ý:
+Check Qdrant:
 
-- `run_graph_eval` chỉ đánh giá sinh Cypher và retrieval graph.
-- Nếu muốn đánh giá answer cuối, cần chạy luồng answer riêng và dùng quota LLM đủ lớn.
-- Nếu dùng Groq free/on-demand, dễ gặp `RateLimitError 429` khi chạy nhiều case vì prompt Cypher dài.
+```bash
+docker compose exec backend python -m tools.qdrant.check_qdrant
+```
+
+Kết quả mong muốn:
+
+```text
+Collection: youmed_sections
+Points count: > 0
+```
 
 ---
 
-## 9. API contract
+## 9. Test API
 
-### 9.1 Chat API
+### 9.1 Test hybrid mode
 
-Request:
-
-```http
-POST /api/chat
-Content-Type: application/json
+```bash
+curl -X POST "http://localhost:8000/api/chat/hybrid" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"DNA là gì và DNA có chức năng gì?","include_debug":true}'
 ```
 
-Body:
+PowerShell:
 
-```json
+```powershell
+@"
 {
-  "message": "Unasyn có tác dụng phụ nào?",
-  "session_id": "optional-session-id"
+  "message": "DNA là gì và DNA có chức năng gì?",
+  "include_debug": true
 }
+"@ | Set-Content -Encoding utf8 .\body.json
+
+curl.exe -X POST "http://localhost:8000/api/chat/hybrid" -H "Content-Type: application/json" --data-binary "@body.json"
 ```
 
-Response:
+Response có các field chính:
 
 ```json
 {
   "answer": "...",
-  "cypher": "MATCH ...",
+  "retrieval_mode": "qdrant_neo4j",
+  "qdrant_hits": [],
   "rows": [],
   "row_count": 0,
   "error": null
@@ -503,183 +516,255 @@ Response:
 
 ---
 
-### 9.2 Graph-only API
+### 9.2 Test Cypher mode cũ
 
-Request:
-
-```http
-POST /api/chat/graph
-Content-Type: application/json
+```bash
+curl -X POST "http://localhost:8000/api/chat" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"DNA là gì?","include_debug":true}'
 ```
 
-Body:
+Graph-only:
 
-```json
-{
-  "message": "DNA được mô tả tổng quan như thế nào?"
-}
+```bash
+curl -X POST "http://localhost:8000/api/chat/graph" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"DNA là gì?","include_debug":true}'
 ```
-
-Response tương tự `/api/chat`, nhưng có thể không sinh answer cuối tùy cấu hình backend.
 
 ---
 
-## 10. Quy tắc an toàn Cypher
+## 10. Notebook Qdrant hybrid
 
-Backend có lớp kiểm tra Cypher trước khi chạy:
+Notebook `raggraph_qdrant_hybrid.ipynb` dùng để test nhanh pipeline hybrid.
 
-Không cho phép:
-
-```text
-CREATE
-MERGE
-SET
-DELETE
-REMOVE
-DROP
-CALL dbms
-CALL apoc
-```
-
-Mục tiêu là chỉ cho phép truy vấn read-only.
-
-Nếu cần mở rộng sau này, nên dùng whitelist query template thay vì để LLM sinh Cypher tự do.
-
----
-
-## 11. Lưu ý khi dùng Neo4j Aura
-
-Dùng URI dạng:
-
-```env
-NEO4J_URI=neo4j+s://xxxxxxxx.databases.neo4j.io
-```
-
-Các lỗi thường gặp:
+Nếu Neo4j đã có graph sẵn, chỉ cần chạy:
 
 ```text
-1. Sai password Aura.
-2. Aura instance đang paused.
-3. Dùng nhầm bolt://localhost:7687 trong Docker.
-4. Backend container không đọc đúng backend/.env.
-5. Chạy --reset nhầm vào Aura database thật.
+1. Cell install packages.
+2. Cell config Neo4j / tạo run_cypher().
+3. Cell init LLM nếu muốn sinh answer.
+4. Chạy toàn bộ phần 15: Qdrant Hybrid Retrieval.
 ```
 
-Test kết nối nhanh:
+Phần 15 gồm:
+
+```text
+15.1 Qdrant config
+15.2 Init Qdrant + embedding model
+15.3 Lấy Section từ Neo4j
+15.4 Build / rebuild Qdrant collection
+15.5 Search Qdrant lấy section_id
+15.6 Neo4j enrich theo section_id
+15.7 ask_hybrid()
+15.8 Test nhiều câu hỏi
+```
+
+Lần đầu nên test ít dữ liệu:
 
 ```python
-from neo4j import GraphDatabase
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-uri = os.getenv("NEO4J_URI")
-user = os.getenv("NEO4J_USERNAME")
-password = os.getenv("NEO4J_PASSWORD")
-
-driver = GraphDatabase.driver(uri, auth=(user, password))
-driver.verify_connectivity()
-print("Connected to Neo4j")
-driver.close()
+qdrant_report = build_qdrant_index_from_neo4j(reset=True, limit=100)
 ```
+
+Sau khi ổn mới build full:
+
+```python
+qdrant_report = build_qdrant_index_from_neo4j(reset=True, limit=None)
+```
+
+Với version `qdrant-client` mới, nếu lỗi:
+
+```text
+AttributeError: 'QdrantClient' object has no attribute 'search'
+```
+
+thì đổi `qdrant.search(...)` sang `qdrant.query_points(...)`.
 
 ---
 
-## 12. Lưu ý khi dùng Groq
+## 11. Evaluation
 
-Nếu chạy nhiều eval case hoặc prompt quá dài, có thể gặp:
+Eval cũ được thiết kế cho Cypher mode.
 
-```text
-RateLimitError 429
-TPD Limit exceeded
-```
-
-Cách xử lý:
-
-```text
-1. Chạy eval theo batch nhỏ.
-2. Tăng sleep_seconds giữa các case.
-3. Giảm độ dài prompt Cypher.
-4. Đổi model có quota cao hơn.
-5. Chờ quota reset.
-```
-
----
-
-## 13. Quy trình đề xuất khi phát triển
-
-```text
-1. Import dữ liệu vào Neo4j.
-2. Check DB bằng tools.db_builder.check_db.
-3. Chạy backend local.
-4. Test /api/chat/graph với vài câu đơn giản.
-5. Chạy frontend.
-6. Chạy eval 20 case easy.
-7. Sửa prompt / evaluator nếu fail.
-8. Chạy tiếp medium / hard / very_hard.
-9. Build Docker.
-10. Deploy dùng Neo4j Aura hoặc Neo4j managed riêng.
-```
-
----
-
-## 14. Ghi chú triển khai thực tế
-
-Đây là project mẫu theo chuẩn class/service để dễ tách phần runtime, tạo DB và eval. Khi đưa vào production nên bổ sung:
-
-```text
-- Authentication cho API.
-- Logging request/response có masking dữ liệu nhạy cảm.
-- Rate limit theo user/session.
-- Cache schema Neo4j.
-- Streaming answer qua SSE/WebSocket.
-- Lưu lịch sử hội thoại.
-- Giới hạn số row và số ký tự gửi vào answer prompt.
-- Monitoring lỗi LLM và lỗi Neo4j.
-```
-
----
-
-## 15. Tóm tắt nhanh lệnh cần nhớ
-
-Chạy backend:
+Chạy graph eval cũ:
 
 ```bash
 cd backend
-uvicorn app.main:app --reload --port 8000
+python -m tools.eval.run_graph_eval --cases data/youmed_graph_test_cases_100.json --limit 20 --results graph_results.json --report graph_eval_report.json
 ```
 
-Chạy frontend:
+Với hybrid mode, vẫn dùng được các metric retrieval vì result vẫn trả `rows` và `section_id`. Tuy nhiên không nên bắt buộc `pass_cypher`, vì hybrid không dùng LLM-generated Cypher.
+
+Policy chấm nên là:
+
+```text
+Cypher mode:
+  pass_overall = pass_cypher + pass_retrieval + pass_answer
+
+Hybrid mode:
+  pass_overall = pass_retrieval + pass_answer
+```
+
+Khi dùng hybrid, cần đảm bảo `rows` có field:
+
+```text
+section_id
+heading
+text
+concepts
+relations hoặc concepts[].relation
+```
+
+---
+
+## 12. Troubleshooting
+
+### 12.1 Backend connect nhầm Neo4j local
+
+Kiểm tra:
 
 ```bash
-cd frontend
-npm run dev
+docker compose exec backend python -c "from app.core.config import get_settings; s=get_settings(); print(s.neo4j_uri); print(s.neo4j_database)"
 ```
+
+Nếu ra:
+
+```text
+bolt://neo4j:7687
+```
+
+thì backend đang dùng Neo4j Docker local, không phải Aura.
+
+---
+
+### 12.2 Neo4j Aura DNS lỗi
+
+Lỗi:
+
+```text
+Failed to DNS resolve address xxxxx.databases.neo4j.io:7687
+```
+
+Kiểm tra trên Windows:
+
+```powershell
+nslookup xxxxx.databases.neo4j.io
+Test-NetConnection xxxxx.databases.neo4j.io -Port 7687
+```
+
+Nếu dùng Docker và chỉ container lỗi DNS, thêm vào service backend:
+
+```yaml
+dns:
+  - 8.8.8.8
+  - 1.1.1.1
+```
+
+---
+
+### 12.3 Qdrant đã upsert xong nhưng lỗi `vectors_count`
+
+Nếu thấy:
+
+```text
+Upserted 5174/5174
+AttributeError: 'CollectionInfo' object has no attribute 'vectors_count'
+```
+
+Dữ liệu đã ghi xong. Chỉ sửa report:
+
+```python
+info = qdrant.get_collection(QDRANT_COLLECTION)
+report["points_count"] = getattr(info, "points_count", None)
+report["vectors_count"] = report["points_count"]
+```
+
+---
+
+### 12.4 Qdrant search lỗi `client.search`
+
+Với `qdrant-client` mới, thay:
+
+```python
+qdrant.search(...)
+```
+
+bằng:
+
+```python
+qdrant.query_points(...)
+```
+
+---
+
+### 12.5 API key bị lộ
+
+Nếu đã paste API key hoặc password vào chat/log, cần rotate lại:
+
+```text
+- Groq API key
+- Qdrant API key
+- Neo4j password
+```
+
+---
+
+## 13. Quy trình chạy đầy đủ từ đầu
+
+```text
+1. Tạo backend/.env.
+2. Cấu hình Neo4j Aura hoặc Neo4j local.
+3. Cấu hình Groq/Gemini LLM.
+4. Cấu hình Qdrant local hoặc Qdrant Cloud.
+5. docker compose up backend frontend qdrant.
+6. Import data vào Neo4j nếu DB chưa có graph.
+7. Check graph bằng tools.db_builder.check_db.
+8. Build Qdrant index bằng tools.qdrant.build_section_index.
+9. Check Qdrant bằng tools.qdrant.check_qdrant.
+10. Test /api/chat/hybrid.
+11. Mở frontend.
+12. Chạy eval nếu cần.
+```
+
+---
+
+## 14. Lệnh nhanh
 
 Chạy Docker:
 
 ```bash
-docker compose up --build
+docker compose down --remove-orphans
+docker compose build --no-cache backend frontend
+docker compose up backend frontend qdrant
 ```
 
-Import DB:
+Import Neo4j:
 
 ```bash
 cd backend
-python -m tools.db_builder.run_import --data data/sample_youmed_articles.jsonl --reset
+python -m tools.db_builder.run_import --data data/youmed_articles.jsonl --reset --batch-size 200 --out import_report.json
 ```
 
-Check DB:
+Build Qdrant:
 
 ```bash
-cd backend
-python -m tools.db_builder.check_db
+docker compose exec backend python -m tools.qdrant.build_section_index --reset --report qdrant_section_index_report.json
 ```
 
-Chạy eval:
+Check Qdrant:
 
 ```bash
-cd backend
-python -m tools.eval.run_graph_eval --cases /path/to/cases.json --limit 20
+docker compose exec backend python -m tools.qdrant.check_qdrant
+```
+
+Test hybrid API:
+
+```bash
+curl -X POST "http://localhost:8000/api/chat/hybrid" -H "Content-Type: application/json" -d '{"message":"DNA là gì?","include_debug":true}'
+```
+
+Mở UI:
+
+```text
+http://localhost:3000
 ```
