@@ -55,3 +55,8 @@ button, textarea { font: inherit; }
   .input-area { left: 0; }
   .message-row { grid-template-columns: 34px minmax(0,1fr); padding-left: 16px; padding-right: 16px; }
 }
+.meta-line {
+  margin-top: 8px;
+  font-size: 12px;
+  opacity: 0.72;
+}

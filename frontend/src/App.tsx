@@ -9,7 +9,7 @@ import type { ChatMessage as ChatMessageType } from './types/chat';
 const initialMessage: ChatMessageType = {
   id: 'welcome',
   role: 'assistant',
-  content: 'Nhập câu hỏi để truy vấn YouMed Neo4j GraphRAG. Kết quả sẽ gồm answer, Cypher và evidence rows.',
+  content: 'Nhập câu hỏi để truy vấn YouMed GraphRAG. Mặc định UI dùng Qdrant lấy section_id, sau đó Neo4j enrich evidence rows.',
 };
 
 function createId() {
@@ -46,6 +46,8 @@ export default function App() {
         rowCount: data.row_count,
         error: data.error,
         answerError: data.answer_error,
+        retrievalMode: data.retrieval_mode,
+        qdrantHits: data.qdrant_hits,
       };
       setMessages((prev) => [...prev, assistantMessage]);
     } catch (error) {

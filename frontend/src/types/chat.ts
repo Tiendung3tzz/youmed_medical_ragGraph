@@ -12,6 +12,8 @@ export interface ChatResponse {
   row_count: number;
   error?: string | null;
   answer_error?: string | null;
+  retrieval_mode?: string | null;
+  qdrant_hits?: EvidenceRow[];
 }
 
 export interface ChatMessage {
@@ -23,4 +25,6 @@ export interface ChatMessage {
   rowCount?: number;
   error?: string | null;
   answerError?: string | null;
+  retrievalMode?: string | null;
+  qdrantHits?: EvidenceRow[];
 }

@@ -14,6 +14,16 @@ function EvidenceRows({ rows }: { rows?: Record<string, unknown>[] }) {
   );
 }
 
+function QdrantHits({ hits }: { hits?: Record<string, unknown>[] }) {
+  if (!hits || hits.length === 0) return null;
+  return (
+    <details className="debug-block">
+      <summary>Qdrant hits ({hits.length})</summary>
+      <pre>{JSON.stringify(hits, null, 2)}</pre>
+    </details>
+  );
+}
+
 export function ChatMessage({ message }: ChatMessageProps) {
   const isUser = message.role === 'user';
   return (
@@ -25,13 +35,18 @@ export function ChatMessage({ message }: ChatMessageProps) {
         {message.error && <div className="error-box">Graph error: {message.error}</div>}
         {message.answerError && <div className="error-box">Answer error: {message.answerError}</div>}
 
+        {!isUser && message.retrievalMode && (
+          <div className="meta-line">Retrieval mode: {message.retrievalMode}</div>
+        )}
+
         {!isUser && message.cypher && (
           <details className="debug-block">
             <summary>Cypher</summary>
             <pre>{message.cypher}</pre>
           </details>
         )}
-
+        
+        {!isUser && <QdrantHits hits={message.qdrantHits as Record<string, unknown>[] | undefined} />}
         {!isUser && <EvidenceRows rows={message.rows as Record<string, unknown>[] | undefined} />}
       </div>
     </div>

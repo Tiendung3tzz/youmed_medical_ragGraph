@@ -43,6 +43,14 @@ class Settings(BaseSettings):
     answer_max_text_chars: int = 900
     max_answer_rows: int = 5
     max_text_chars: int = 1200
+    
+    qdrant_url: str = "https://d4a58b0b-8ec6-4bbe-aeb6-475372a984d4.eu-central-1-0.aws.cloud.qdrant.io"
+    qdrant_api_key: str = ""
+    qdrant_collection: str = "youmed_sections"
+    qdrant_top_k: int = 10
+    qdrant_score_threshold: float = 0.0
+    qdrant_timeout: float = 30.0
+    embedding_model_name: str = "BAAI/bge-small-en-v1.5"
 
     model_config = SettingsConfigDict(
         env_file=".env",
