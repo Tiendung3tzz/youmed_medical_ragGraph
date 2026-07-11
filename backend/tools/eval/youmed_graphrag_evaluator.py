@@ -1,5 +1,5 @@
 # youmed_graphrag_evaluator.py
-# Evaluation toolkit for Neo4j GraphRAG / GraphCypherQAChain.
+# Evaluation toolkit for Neo4j GraphRAG / GraphCypherQAChain and Qdrant-Neo4j hybrid retrieval.
 # Designed for the YouMed medical knowledge graph notebook.
 
 from __future__ import annotations
@@ -174,6 +174,179 @@ def get_gold_row_ids(case: dict) -> List[str]:
 
 def get_row_ids(rows: Sequence[dict]) -> List[str]:
     return [row_to_id(row, i) for i, row in enumerate(rows or [])]
+
+
+def is_hybrid_result(result: dict) -> bool:
+    """
+    Detect Qdrant-Neo4j hybrid retrieval results.
+
+    Hybrid mode does not use LLM-generated Cypher for the main retrieval step.
+    The expected result shape is still compatible with the evaluator:
+    {
+      "retrieval_mode": "qdrant_neo4j",
+      "qdrant_hits": [...],
+      "rows": [...],
+      "row_count": int,
+      "answer": str,
+      "error": optional str
+    }
+    """
+    if not isinstance(result, dict):
+        return False
+
+    mode = str(result.get("retrieval_mode") or "").lower()
+    if mode in {"qdrant_neo4j", "hybrid", "hybrid_qdrant_neo4j", "qdrant_hybrid"}:
+        return True
+
+    return bool(result.get("qdrant_hits"))
+
+
+def get_qdrant_hit_ids(result: dict) -> List[str]:
+    """
+    Extract Section ids directly from Qdrant hits.
+
+    This evaluates the raw vector-search ranking before Neo4j enrichment.
+    Each hit is expected to contain section_id either at the top level or inside payload.
+    """
+    ids: List[str] = []
+
+    for hit in result.get("qdrant_hits") or []:
+        if not isinstance(hit, dict):
+            continue
+
+        value = hit.get("section_id")
+        if value in [None, ""]:
+            payload = hit.get("payload") or {}
+            if isinstance(payload, dict):
+                value = payload.get("section_id")
+
+        if value not in [None, ""]:
+            ids.append(str(value).strip())
+
+    # Deduplicate while preserving Qdrant ranking order.
+    return list(dict.fromkeys(ids))
+
+
+def first_relevant_rank(retrieved_ids: Sequence[str], gold_ids: Sequence[str]) -> Optional[int]:
+    """
+    Return 1-based rank of the first retrieved relevant item.
+    Lower is better. None means no relevant item was retrieved.
+    """
+    gold = set(gold_ids or [])
+    if not gold:
+        return None
+
+    for rank, rid in enumerate(retrieved_ids or [], start=1):
+        if rid in gold:
+            return rank
+
+    return None
+
+
+def first_relevant_id(retrieved_ids: Sequence[str], gold_ids: Sequence[str]) -> Optional[str]:
+    gold = set(gold_ids or [])
+    if not gold:
+        return None
+
+    for rid in retrieved_ids or []:
+        if rid in gold:
+            return rid
+
+    return None
+
+
+def precision_at_k(retrieved_ids: Sequence[str], gold_ids: Sequence[str], k: int) -> float:
+    if k <= 0:
+        return 0.0
+    top = list(retrieved_ids or [])[:k]
+    if not top:
+        return 0.0
+    gold = set(gold_ids or [])
+    return safe_div(sum(1 for rid in top if rid in gold), len(top))
+
+
+def f1_at_k(retrieved_ids: Sequence[str], gold_ids: Sequence[str], k: int) -> float:
+    p = precision_at_k(retrieved_ids, gold_ids, k)
+    r = recall_at_k(retrieved_ids, gold_ids, k)
+    return safe_div(2 * p * r, p + r)
+
+
+def rank_score_at_k(retrieved_ids: Sequence[str], gold_ids: Sequence[str], k: int) -> float:
+    """
+    Linear rank-aware score in [0, 1].
+
+    - Rank 1 relevant result => 1.0
+    - Rank k relevant result => 1/k
+    - No relevant result in top-k => 0.0
+
+    This directly captures the requirement:
+    "Kết quả đúng càng nằm gần trên thì điểm càng cao".
+    """
+    rank = first_relevant_rank(retrieved_ids, gold_ids)
+    if rank is None or rank > k or k <= 0:
+        return 0.0
+
+    return safe_div(k - rank + 1, k)
+
+
+def average_precision_at_k(retrieved_ids: Sequence[str], gold_ids: Sequence[str], k: int) -> float:
+    gold = set(gold_ids or [])
+    if not gold:
+        return 0.0
+
+    hits = 0
+    total = 0.0
+    for i, rid in enumerate((retrieved_ids or [])[:k], start=1):
+        if rid in gold:
+            hits += 1
+            total += hits / i
+
+    return total / min(len(gold), k)
+
+
+def build_binary_relevance_map(gold_ids: Sequence[str]) -> Dict[str, float]:
+    return {str(gid): 1.0 for gid in (gold_ids or [])}
+
+
+def ranking_quality_metrics(
+    retrieved_ids: Sequence[str],
+    gold_ids: Sequence[str],
+    k_values: Sequence[int],
+    relevance_by_id: Optional[Dict[str, float]] = None,
+) -> dict:
+    """
+    Ranking metrics for retrieval outputs.
+
+    Key metrics:
+    - first_relevant_rank: exact rank of first correct section.
+    - mrr: 1 / first_relevant_rank.
+    - rank_score_at_k: linear top-heavy score; closer to top means higher.
+    - ndcg_at_k: graded rank quality if relevance_by_id is provided.
+    """
+    gold_ids = list(dict.fromkeys(str(x).strip() for x in (gold_ids or []) if x not in [None, ""]))
+    retrieved_ids = list(dict.fromkeys(str(x).strip() for x in (retrieved_ids or []) if x not in [None, ""]))
+
+    relevance_by_id = relevance_by_id or build_binary_relevance_map(gold_ids)
+
+    metrics = {
+        "first_relevant_rank": first_relevant_rank(retrieved_ids, gold_ids),
+        "first_relevant_id": first_relevant_id(retrieved_ids, gold_ids),
+        "mrr": mrr(retrieved_ids, gold_ids),
+        "map": average_precision(retrieved_ids, gold_ids),
+        "retrieved_count": len(retrieved_ids),
+        "gold_count": len(gold_ids),
+    }
+
+    for k in k_values:
+        metrics[f"hit_at_{k}"] = hit_at_k(retrieved_ids, gold_ids, k)
+        metrics[f"recall_at_{k}"] = recall_at_k(retrieved_ids, gold_ids, k)
+        metrics[f"precision_at_{k}"] = precision_at_k(retrieved_ids, gold_ids, k)
+        metrics[f"f1_at_{k}"] = f1_at_k(retrieved_ids, gold_ids, k)
+        metrics[f"rank_score_at_{k}"] = rank_score_at_k(retrieved_ids, gold_ids, k)
+        metrics[f"average_precision_at_{k}"] = average_precision_at_k(retrieved_ids, gold_ids, k)
+        metrics[f"ndcg_at_{k}"] = ndcg_at_k(retrieved_ids, relevance_by_id, k)
+
+    return metrics
 
 
 def is_read_only_cypher(cypher: str, forbidden_keywords: Optional[List[str]] = None) -> bool:
@@ -372,16 +545,35 @@ def evaluate_retrieval(case: dict, result: dict) -> dict:
     gold_row_ids = get_gold_row_ids(case)
     k_values = checks.get("k_values", [1, 3, 5, 10])
 
+    # Final evidence ranking after Neo4j enrichment.
     retrieved_ids = get_row_ids(rows)
+
+    # Raw Qdrant ranking before Neo4j enrichment. Useful for checking whether
+    # vector retrieval itself found the right section_id near the top.
+    qdrant_hit_ids = get_qdrant_hit_ids(result)
 
     entity_hits = [e for e in gold_entities if contains_any(context_text, [e])]
     term_hits = [t for t in gold_terms if contains_any(context_text, [t])]
-    relation_hits = [r for r in gold_relations if contains_any(result.get("cypher", ""), [r]) or contains_any(context_text, [r])]
+    relation_hits = [
+        r for r in gold_relations
+        if contains_any(result.get("cypher", ""), [r]) or contains_any(context_text, [r])
+    ]
 
-    ranking = {}
-    for k in k_values:
-        ranking[f"hit_at_{k}"] = hit_at_k(retrieved_ids, gold_row_ids, k)
-        ranking[f"recall_at_{k}"] = recall_at_k(retrieved_ids, gold_row_ids, k)
+    ranking = ranking_quality_metrics(
+        retrieved_ids=retrieved_ids,
+        gold_ids=gold_row_ids,
+        k_values=k_values,
+        relevance_by_id=(case.get("ranking_checks", {}) or {}).get("relevance_by_row_id", {}),
+    )
+
+    qdrant_ranking = None
+    if qdrant_hit_ids:
+        qdrant_ranking = ranking_quality_metrics(
+            retrieved_ids=qdrant_hit_ids,
+            gold_ids=gold_row_ids,
+            k_values=k_values,
+            relevance_by_id=(case.get("ranking_checks", {}) or {}).get("relevance_by_row_id", {}),
+        )
 
     return {
         "row_count": row_count,
@@ -392,37 +584,55 @@ def evaluate_retrieval(case: dict, result: dict) -> dict:
         "relation_hit": True if not gold_relations else bool(relation_hits),
         "string_presence": bool(entity_hits or term_hits or not (gold_entities or gold_terms)),
         "retrieved_row_ids": retrieved_ids,
+        "qdrant_hit_ids": qdrant_hit_ids,
         "gold_row_ids_count": len(gold_row_ids),
         "ranking": ranking,
+        "qdrant_ranking": qdrant_ranking,
     }
 
 
 def evaluate_ranking(case: dict, result: dict) -> dict:
-    checks = case.get("ranking_checks", {})
-    if not checks.get("enabled", False):
-        return {"enabled": False}
-
+    checks = case.get("ranking_checks", {}) or {}
     rows = result.get("rows") or result.get("result") or []
     retrieved_ids = get_row_ids(rows)
+    qdrant_hit_ids = get_qdrant_hit_ids(result)
+
     gold_ids = checks.get("gold_ranked_items", []) or get_gold_row_ids(case)
-    relevance_by_id = checks.get("relevance_by_row_id", {})
+    relevance_by_id = checks.get("relevance_by_row_id", {}) or build_binary_relevance_map(gold_ids)
     k_values = checks.get("k_values", [3, 5, 10])
     cypher = result.get("cypher", "")
 
-    metrics = {
+    enabled = bool(checks.get("enabled", False) or gold_ids)
+    if not enabled:
+        return {"enabled": False}
+
+    metrics = ranking_quality_metrics(
+        retrieved_ids=retrieved_ids,
+        gold_ids=gold_ids,
+        k_values=k_values,
+        relevance_by_id=relevance_by_id,
+    )
+    metrics.update({
         "enabled": True,
-        "mrr": mrr(retrieved_ids, gold_ids),
-        "map": average_precision(retrieved_ids, gold_ids),
         "requires_order_by_pass": True,
-    }
+    })
 
+    # ORDER BY is only relevant for Cypher-generated ranking.
+    # Qdrant hybrid ranking is determined by vector score and is not expected to contain ORDER BY.
     if checks.get("requires_order_by", False):
-        metrics["requires_order_by_pass"] = "ORDER BY" in (cypher or "").upper()
+        if is_hybrid_result(result):
+            metrics["requires_order_by_pass"] = True
+            metrics["requires_order_by_skipped_for_hybrid"] = True
+        else:
+            metrics["requires_order_by_pass"] = "ORDER BY" in (cypher or "").upper()
 
-    for k in k_values:
-        metrics[f"hit_at_{k}"] = hit_at_k(retrieved_ids, gold_ids, k)
-        metrics[f"recall_at_{k}"] = recall_at_k(retrieved_ids, gold_ids, k)
-        metrics[f"ndcg_at_{k}"] = ndcg_at_k(retrieved_ids, relevance_by_id, k)
+    if qdrant_hit_ids:
+        metrics["qdrant"] = ranking_quality_metrics(
+            retrieved_ids=qdrant_hit_ids,
+            gold_ids=gold_ids,
+            k_values=k_values,
+            relevance_by_id=relevance_by_id,
+        )
 
     return metrics
 
@@ -477,6 +687,8 @@ def evaluate_answer(case: dict, result: dict) -> dict:
 
 
 def evaluate_one(case: dict, result: dict) -> dict:
+    hybrid_mode = is_hybrid_result(result)
+
     cypher_eval = evaluate_cypher(case, result)
     # Ensure cypher is available downstream.
     result2 = dict(result)
@@ -486,20 +698,31 @@ def evaluate_one(case: dict, result: dict) -> dict:
     ranking_eval = evaluate_ranking(case, result2)
     answer_eval = evaluate_answer(case, result2)
 
-    # Simple pass/fail policy.
-    pass_cypher = (
-        cypher_eval["has_cypher"]
-        and cypher_eval["execution_success"]
-        and cypher_eval["read_only"]
-        and cypher_eval["preferred_edge_hit"]
-        and cypher_eval["entity_filter_hit"]
-        and cypher_eval.get("valid_kind_filter", True)
-    )
+    if hybrid_mode:
+        # Hybrid retrieval uses Qdrant section_id search + fixed Neo4j enrichment.
+        # There is no LLM-generated Cypher to evaluate.
+        pass_cypher = True
+        cypher_eval["skipped_for_hybrid"] = True
+        cypher_eval["note"] = (
+            "Hybrid mode uses Qdrant section_id retrieval and fixed Neo4j enrichment, "
+            "not LLM-generated Cypher."
+        )
+    else:
+        pass_cypher = (
+            cypher_eval["has_cypher"]
+            and cypher_eval["execution_success"]
+            and cypher_eval["read_only"]
+            and cypher_eval["preferred_edge_hit"]
+            and cypher_eval["entity_filter_hit"]
+            and cypher_eval.get("valid_kind_filter", True)
+        )
+
     ranking = retrieval_eval.get("ranking", {})
     gold_row_ids_count = retrieval_eval.get("gold_row_ids_count", 0)
 
     if gold_row_ids_count > 0:
-        retrieval_gold_hit = ranking.get("hit_at_10", 0.0) > 0
+        # A retrieval is considered gold-hit if any gold section appears in the retrieved list.
+        retrieval_gold_hit = bool(ranking.get("mrr", 0.0) > 0.0)
     else:
         retrieval_gold_hit = True
 
@@ -518,6 +741,7 @@ def evaluate_one(case: dict, result: dict) -> dict:
         "difficulty": case.get("difficulty"),
         "type": case.get("type"),
         "question": case.get("question"),
+        "retrieval_mode": result.get("retrieval_mode") or ("qdrant_neo4j" if hybrid_mode else "cypher"),
         "pass_cypher": pass_cypher,
         "pass_retrieval": pass_retrieval,
         "pass_answer": pass_answer,
@@ -563,12 +787,63 @@ def summarize_eval(details: Sequence[dict]) -> dict:
     def rate(key: str) -> float:
         return safe_div(sum(1 for d in details if d.get(key)), total)
 
+    def values_from_path(path: Sequence[str], require_gold: bool = False) -> List[float]:
+        values: List[float] = []
+        for d in details:
+            if require_gold and ((d.get("retrieval", {}) or {}).get("gold_row_ids_count", 0) <= 0):
+                continue
+
+            cur: Any = d
+            ok = True
+            for key in path:
+                if not isinstance(cur, dict) or key not in cur:
+                    ok = False
+                    break
+                cur = cur[key]
+
+            if ok and isinstance(cur, (int, float)) and not isinstance(cur, bool):
+                values.append(float(cur))
+
+        return values
+
+    def avg_path(path: Sequence[str], require_gold: bool = False) -> Optional[float]:
+        values = values_from_path(path, require_gold=require_gold)
+        if not values:
+            return None
+        return safe_div(sum(values), len(values))
+
+    def avg_first_rank() -> Optional[float]:
+        ranks: List[float] = []
+        for d in details:
+            if ((d.get("retrieval", {}) or {}).get("gold_row_ids_count", 0) <= 0):
+                continue
+            rank = (((d.get("retrieval", {}) or {}).get("ranking", {}) or {}).get("first_relevant_rank"))
+            if isinstance(rank, (int, float)):
+                ranks.append(float(rank))
+        if not ranks:
+            return None
+        return safe_div(sum(ranks), len(ranks))
+
     summary = {
         "total": total,
         "pass_overall_rate": rate("pass_overall"),
         "pass_cypher_rate": rate("pass_cypher"),
         "pass_retrieval_rate": rate("pass_retrieval"),
         "pass_answer_rate": rate("pass_answer"),
+
+        # Retrieval ranking summary. These are computed only on cases with gold ids.
+        "avg_hit_at_10": avg_path(["retrieval", "ranking", "hit_at_10"], require_gold=True),
+        "avg_recall_at_10": avg_path(["retrieval", "ranking", "recall_at_10"], require_gold=True),
+        "avg_precision_at_10": avg_path(["retrieval", "ranking", "precision_at_10"], require_gold=True),
+        "avg_mrr": avg_path(["retrieval", "ranking", "mrr"], require_gold=True),
+        "avg_map": avg_path(["retrieval", "ranking", "map"], require_gold=True),
+        "avg_rank_score_at_10": avg_path(["retrieval", "ranking", "rank_score_at_10"], require_gold=True),
+        "avg_first_relevant_rank": avg_first_rank(),
+
+        # Raw Qdrant ranking summary before Neo4j enrichment.
+        "avg_qdrant_mrr": avg_path(["retrieval", "qdrant_ranking", "mrr"], require_gold=True),
+        "avg_qdrant_rank_score_at_10": avg_path(["retrieval", "qdrant_ranking", "rank_score_at_10"], require_gold=True),
+
         "by_difficulty": {},
         "by_type": {},
     }
@@ -609,14 +884,21 @@ def run_graph_tests_for_eval(
     save_path: Optional[str | Path] = None,
 ) -> List[dict]:
     """
-    Run Cypher + graph retrieval only.
-    ask_graph_func must return:
+    Run retrieval tests.
+
+    Compatible with:
+    - Cypher mode: GraphCypherQAChain returns cypher + rows.
+    - Hybrid mode: Qdrant returns section_id hits, then Neo4j enriches rows.
+
+    ask_graph_func should return:
     {
       "question": str,
-      "cypher": str,
       "rows": list[dict],
       "row_count": int,
-      "error": optional str
+      "error": optional str,
+      "retrieval_mode": optional str,
+      "qdrant_hits": optional list[dict],
+      "cypher": optional str
     }
     """
     cases = list(eval_cases[:limit] if limit else eval_cases)
@@ -645,8 +927,11 @@ def run_graph_tests_for_eval(
             item["rows"] = item.get("rows") or item.get("result") or []
             item["row_count"] = len(item["rows"]) if isinstance(item["rows"], list) else item.get("row_count", 0)
 
-            print("\nCYPHER:")
-            print(item["cypher"] or "[EMPTY CYPHER]")
+            print("\nRETRIEVAL MODE:", item.get("retrieval_mode") or ("cypher" if item.get("cypher") else "unknown"))
+            print("\nCYPHER / DEBUG QUERY:")
+            print(item["cypher"] or "[NO LLM-GENERATED CYPHER]")
+            if item.get("qdrant_hits"):
+                print("\nQDRANT HITS:", len(item.get("qdrant_hits") or []))
             print("\nROW COUNT:", item["row_count"])
 
         except Exception as e:
@@ -701,8 +986,11 @@ def run_answer_tests_for_eval(
             item["rows"] = item.get("rows") or item.get("result") or []
             item["row_count"] = len(item["rows"]) if isinstance(item["rows"], list) else item.get("row_count", 0)
 
-            print("\nCYPHER:")
-            print(item["cypher"] or "[EMPTY CYPHER]")
+            print("\nRETRIEVAL MODE:", item.get("retrieval_mode") or ("cypher" if item.get("cypher") else "unknown"))
+            print("\nCYPHER / DEBUG QUERY:")
+            print(item["cypher"] or "[NO LLM-GENERATED CYPHER]")
+            if item.get("qdrant_hits"):
+                print("\nQDRANT HITS:", len(item.get("qdrant_hits") or []))
             print("\nROW COUNT:", item["row_count"])
             print("\nANSWER PREVIEW:")
             print((item.get("answer") or "")[:800])
@@ -861,3 +1149,6 @@ def run_llm_judge(
 
 def print_summary(report: dict) -> None:
     print(json.dumps(report.get("summary", report), ensure_ascii=False, indent=2))
+
+
+EVALUATOR_VERSION = "qdrant_hybrid_ranking_v1"
