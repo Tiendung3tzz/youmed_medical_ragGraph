@@ -10,6 +10,9 @@ def _hide_debug(result: dict) -> dict:
     result["cypher"] = ""
     result["rows"] = []
     result["qdrant_hits"] = []
+    result["candidate_section_ids"] = []
+    result["section_ids"] = []
+    result["debug"] = {}
     return result
 
 @router.post("", response_model=ChatResponse)

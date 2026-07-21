@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o-mini"
 
     # Neo4j
-    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_uri: str = ""
     neo4j_username: str = "neo4j"
     neo4j_password: str = "password"
     neo4j_database: str = "neo4j"
@@ -48,10 +48,24 @@ class Settings(BaseSettings):
     qdrant_api_key: str = ""
     qdrant_collection: str = "youmed_sections"
     qdrant_top_k: int = 10
+    qdrant_search_top_k: int = 50
     qdrant_score_threshold: float = 0.0
     qdrant_timeout: float = 30.0
-    embedding_model_name: str = "BAAI/bge-small-en-v1.5"
+    embedding_model_name: str = ""
 
+    # Routed retrieval / intent router
+    use_llm_intent_router: bool = True
+    intent_confidence_threshold: float = 0.5
+
+    # Optional cross-encoder reranker.
+    # Can be a HuggingFace model id or a local path, e.g. /models/bge-reranker-base.
+    reranker_enabled: bool = True
+    reranker_model_name: str = ""
+    reranker_device: str = ""
+    reranker_max_length: int = 512
+    reranker_max_chars: int = 900
+    reranker_batch_size: int = 4
+    
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

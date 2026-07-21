@@ -11,6 +11,7 @@ configure_logging(settings.debug)
 
 app = FastAPI(title=settings.app_name)
 
+        
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.frontend_origins_list,
@@ -21,3 +22,7 @@ app.add_middleware(
 
 app.include_router(health_router, prefix=settings.api_prefix)
 app.include_router(chat_router, prefix=settings.api_prefix)
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}

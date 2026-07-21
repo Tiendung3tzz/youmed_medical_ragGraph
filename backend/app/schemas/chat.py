@@ -18,6 +18,9 @@ class ChatResponse(BaseModel):
     answer_error: Optional[str] = None
     retrieval_mode: Optional[str] = None
     qdrant_hits: List[Dict[str, Any]] = Field(default_factory=list)
+    candidate_section_ids: List[str] = Field(default_factory=list)
+    section_ids: List[str] = Field(default_factory=list)
+    debug: Dict[str, Any] = Field(default_factory=dict)
 
 
 class GraphOnlyResponse(BaseModel):
@@ -28,6 +31,9 @@ class GraphOnlyResponse(BaseModel):
     error: Optional[str] = None
     retrieval_mode: Optional[str] = None
     qdrant_hits: List[Dict[str, Any]] = Field(default_factory=list)
+    candidate_section_ids: List[str] = Field(default_factory=list)
+    section_ids: List[str] = Field(default_factory=list)
+    debug: Dict[str, Any] = Field(default_factory=dict)
 
 class HealthResponse(BaseModel):
     status: str

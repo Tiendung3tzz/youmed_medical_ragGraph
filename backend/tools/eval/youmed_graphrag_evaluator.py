@@ -1152,3 +1152,380 @@ def print_summary(report: dict) -> None:
 
 
 EVALUATOR_VERSION = "qdrant_hybrid_ranking_v1"
+
+
+# =============================================================================
+# Qdrant hybrid notebook orchestration helpers
+# =============================================================================
+
+def sample_cases_by_difficulty(
+    eval_cases: Sequence[dict],
+    n_per_level: int = 10,
+    seed: int = 42,
+    level_key: str = "difficulty",
+    levels: Optional[Sequence[str]] = None,
+) -> List[dict]:
+    """
+    Randomly sample up to n_per_level cases for each difficulty/level.
+
+    Typical usage:
+        selected = sample_cases_by_difficulty(eval_cases, n_per_level=10, seed=42)
+
+    The function preserves reproducibility by using a local random generator.
+    """
+    import random
+
+    rng = random.Random(seed)
+    grouped: Dict[str, List[dict]] = defaultdict(list)
+
+    for case in eval_cases or []:
+        level = str(case.get(level_key) or "unknown")
+        if levels is not None and level not in set(str(x) for x in levels):
+            continue
+        grouped[level].append(case)
+
+    selected: List[dict] = []
+    for level in sorted(grouped.keys()):
+        cases = list(grouped[level])
+        rng.shuffle(cases)
+        selected.extend(cases[: min(n_per_level, len(cases))])
+
+    return selected
+
+
+def sample_breakdown(
+    eval_cases: Sequence[dict],
+    level_key: str = "difficulty",
+) -> Dict[str, int]:
+    """Return count of cases by difficulty/level."""
+    out: Dict[str, int] = defaultdict(int)
+    for case in eval_cases or []:
+        out[str(case.get(level_key) or "unknown")] += 1
+    return dict(sorted(out.items(), key=lambda x: x[0]))
+
+
+def _get_nested_metric(obj: dict, path: Sequence[str]) -> Any:
+    cur: Any = obj
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return None
+        cur = cur[key]
+    return cur
+
+
+def _numeric_values_from_details(
+    details: Sequence[dict],
+    path: Sequence[str],
+    require_gold: bool = False,
+) -> List[float]:
+    values: List[float] = []
+    for item in details or []:
+        if require_gold and ((item.get("retrieval", {}) or {}).get("gold_row_ids_count", 0) <= 0):
+            continue
+        value = _get_nested_metric(item, path)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            values.append(float(value))
+    return values
+
+
+def _avg_numeric(
+    details: Sequence[dict],
+    path: Sequence[str],
+    require_gold: bool = False,
+) -> Optional[float]:
+    values = _numeric_values_from_details(details, path, require_gold=require_gold)
+    if not values:
+        return None
+    return safe_div(sum(values), len(values))
+
+
+def _rate_from_details(details: Sequence[dict], key: str) -> float:
+    return safe_div(sum(1 for item in details or [] if bool(item.get(key))), len(details or []))
+
+
+def selected_metric_definitions(k: int = 10) -> dict:
+    """
+    Recommended metrics for the current Qdrant-Neo4j hybrid pipeline.
+
+    Stages:
+    - qdrant_retrieval: raw vector search result before Neo4j enrichment.
+    - final_retrieval: final evidence rows after Neo4j enrichment and ordering.
+    - answer_generation: final answer quality proxies.
+    """
+    return {
+        "qdrant_retrieval": {
+            f"hit_at_{k}": "Qdrant có lấy trúng ít nhất một gold section trong top-k không.",
+            f"recall_at_{k}": "Qdrant lấy được bao nhiêu gold sections trong top-k.",
+            "mrr": "Gold section đầu tiên nằm càng gần top thì điểm càng cao.",
+            f"rank_score_at_{k}": "Điểm tuyến tính theo rank; rank 1 = 1.0, rank k = 1/k.",
+            "first_relevant_rank": "Vị trí đầu tiên của section đúng trong Qdrant hits.",
+        },
+        "final_retrieval": {
+            f"hit_at_{k}": "Rows cuối cùng có chứa gold section trong top-k không.",
+            f"recall_at_{k}": "Rows cuối cùng bao phủ được bao nhiêu gold sections.",
+            "mrr": "Gold section đầu tiên trong final rows nằm càng gần top càng tốt.",
+            f"rank_score_at_{k}": "Điểm tuyến tính theo vị trí trong final rows.",
+            "pass_retrieval_rate": "Tỷ lệ case pass retrieval theo policy hiện tại.",
+            "row_count": "Số evidence rows sau Neo4j enrichment.",
+        },
+        "answer_generation": {
+            "pass_answer_rate": "Không vi phạm safety và thỏa string presence nếu testcase yêu cầu.",
+            "has_answer_rate": "Tỷ lệ case có sinh answer.",
+            "string_presence_pass_rate": "Answer có chứa keyword bắt buộc khi testcase yêu cầu.",
+            "medical_safety_violation_rate": "Tỷ lệ answer chứa cụm khuyến nghị y khoa nguy hiểm.",
+            "grounded_token_overlap_proxy": "Proxy yếu cho groundedness: token overlap giữa answer và evidence rows.",
+            "llm_judge_optional": "Dùng run_llm_judge để chấm groundedness/completeness/hallucination nếu cần chất lượng cao hơn.",
+        },
+        "not_primary_unless_reference_answer_exists": {
+            "rouge_1_f1": "Chỉ hữu ích khi có reference_answer đã review thủ công.",
+            "rouge_l_f1": "Chỉ hữu ích khi có reference_answer đã review thủ công.",
+            "exact_match": "Không phù hợp cho câu trả lời tự nhiên dài.",
+        },
+    }
+
+
+def build_stage_metric_summary(details: Sequence[dict], k: int = 10) -> dict:
+    """
+    Build separated summaries for:
+    1. Raw Qdrant retrieval.
+    2. Final retrieval after Neo4j enrichment.
+    3. Answer generation.
+    """
+    details = list(details or [])
+
+    def avg_first_rank(path_prefix: Sequence[str]) -> Optional[float]:
+        ranks: List[float] = []
+        for item in details:
+            if ((item.get("retrieval", {}) or {}).get("gold_row_ids_count", 0) <= 0):
+                continue
+            value = _get_nested_metric(item, list(path_prefix) + ["first_relevant_rank"])
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                ranks.append(float(value))
+        if not ranks:
+            return None
+        return safe_div(sum(ranks), len(ranks))
+
+    qdrant = {
+        f"avg_hit_at_{k}": _avg_numeric(details, ["retrieval", "qdrant_ranking", f"hit_at_{k}"], require_gold=True),
+        f"avg_recall_at_{k}": _avg_numeric(details, ["retrieval", "qdrant_ranking", f"recall_at_{k}"], require_gold=True),
+        "avg_mrr": _avg_numeric(details, ["retrieval", "qdrant_ranking", "mrr"], require_gold=True),
+        "avg_map": _avg_numeric(details, ["retrieval", "qdrant_ranking", "map"], require_gold=True),
+        f"avg_rank_score_at_{k}": _avg_numeric(details, ["retrieval", "qdrant_ranking", f"rank_score_at_{k}"], require_gold=True),
+        "avg_first_relevant_rank": avg_first_rank(["retrieval", "qdrant_ranking"]),
+    }
+
+    final_retrieval = {
+        "pass_retrieval_rate": _rate_from_details(details, "pass_retrieval"),
+        f"avg_hit_at_{k}": _avg_numeric(details, ["retrieval", "ranking", f"hit_at_{k}"], require_gold=True),
+        f"avg_recall_at_{k}": _avg_numeric(details, ["retrieval", "ranking", f"recall_at_{k}"], require_gold=True),
+        f"avg_precision_at_{k}": _avg_numeric(details, ["retrieval", "ranking", f"precision_at_{k}"], require_gold=True),
+        "avg_mrr": _avg_numeric(details, ["retrieval", "ranking", "mrr"], require_gold=True),
+        "avg_map": _avg_numeric(details, ["retrieval", "ranking", "map"], require_gold=True),
+        f"avg_rank_score_at_{k}": _avg_numeric(details, ["retrieval", "ranking", f"rank_score_at_{k}"], require_gold=True),
+        "avg_first_relevant_rank": avg_first_rank(["retrieval", "ranking"]),
+        "avg_row_count": _avg_numeric(details, ["retrieval", "row_count"], require_gold=False),
+    }
+
+    answer = {
+        "pass_answer_rate": _rate_from_details(details, "pass_answer"),
+        "has_answer_rate": safe_div(
+            sum(1 for item in details if (item.get("answer", {}) or {}).get("has_answer")),
+            len(details),
+        ),
+        "string_presence_pass_rate": safe_div(
+            sum(1 for item in details if (item.get("answer", {}) or {}).get("string_presence_pass")),
+            len(details),
+        ),
+        "medical_safety_violation_rate": safe_div(
+            sum(1 for item in details if (item.get("answer", {}) or {}).get("medical_safety_violation")),
+            len(details),
+        ),
+        "avg_grounded_token_overlap_proxy": _avg_numeric(details, ["answer", "grounded_token_overlap_proxy"], require_gold=False),
+        "avg_answer_must_include_hit_count": _avg_numeric(details, ["answer", "answer_must_include_hit_count"], require_gold=False),
+    }
+
+    return {
+        "qdrant_retrieval": qdrant,
+        "final_retrieval": final_retrieval,
+        "answer_generation": answer,
+    }
+
+
+def build_stage_metric_summary_by_level(
+    details: Sequence[dict],
+    k: int = 10,
+    level_key: str = "difficulty",
+) -> dict:
+    grouped: Dict[str, List[dict]] = defaultdict(list)
+    for item in details or []:
+        grouped[str(item.get(level_key) or "unknown")].append(item)
+
+    return {
+        level: build_stage_metric_summary(rows, k=k)
+        for level, rows in sorted(grouped.items(), key=lambda x: x[0])
+    }
+
+
+def build_case_metric_rows(report: dict, k: int = 10) -> List[dict]:
+    """
+    Flatten report details into row-level records for pandas display/export.
+    """
+    rows: List[dict] = []
+
+    for item in report.get("details", []) or []:
+        retrieval = item.get("retrieval", {}) or {}
+        q_rank = retrieval.get("qdrant_ranking", {}) or {}
+        f_rank = retrieval.get("ranking", {}) or {}
+        answer = item.get("answer", {}) or {}
+
+        rows.append({
+            "id": item.get("id"),
+            "difficulty": item.get("difficulty"),
+            "type": item.get("type"),
+            "question": item.get("question"),
+            "pass_overall": item.get("pass_overall"),
+            "pass_retrieval": item.get("pass_retrieval"),
+            "pass_answer": item.get("pass_answer"),
+            "row_count": retrieval.get("row_count"),
+            "gold_count": retrieval.get("gold_row_ids_count"),
+
+            "qdrant_first_rank": q_rank.get("first_relevant_rank"),
+            "qdrant_mrr": q_rank.get("mrr"),
+            f"qdrant_hit_at_{k}": q_rank.get(f"hit_at_{k}"),
+            f"qdrant_recall_at_{k}": q_rank.get(f"recall_at_{k}"),
+            f"qdrant_rank_score_at_{k}": q_rank.get(f"rank_score_at_{k}"),
+
+            "final_first_rank": f_rank.get("first_relevant_rank"),
+            "final_mrr": f_rank.get("mrr"),
+            f"final_hit_at_{k}": f_rank.get(f"hit_at_{k}"),
+            f"final_recall_at_{k}": f_rank.get(f"recall_at_{k}"),
+            f"final_rank_score_at_{k}": f_rank.get(f"rank_score_at_{k}"),
+
+            "has_answer": answer.get("has_answer"),
+            "string_presence_pass": answer.get("string_presence_pass"),
+            "medical_safety_violation": answer.get("medical_safety_violation"),
+            "grounded_token_overlap_proxy": answer.get("grounded_token_overlap_proxy"),
+            "raw_error": item.get("raw_error"),
+        })
+
+    return rows
+
+
+def build_hybrid_metric_report(
+    eval_cases: Sequence[dict],
+    results: Sequence[dict],
+    k: int = 10,
+    level_key: str = "difficulty",
+) -> dict:
+    """
+    Evaluate results and add stage-separated metric summaries.
+    """
+    report = evaluate_all(eval_cases, results)
+    details = report.get("details", []) or []
+
+    report["metric_selection"] = selected_metric_definitions(k=k)
+    report["stage_summary"] = build_stage_metric_summary(details, k=k)
+    report["stage_summary_by_level"] = build_stage_metric_summary_by_level(details, k=k, level_key=level_key)
+    report["case_metric_rows"] = build_case_metric_rows(report, k=k)
+
+    return report
+
+
+def print_hybrid_metric_report(report: dict) -> None:
+    """
+    Print a compact stage-separated summary.
+    """
+    compact = {
+        "summary": report.get("summary", {}),
+        "stage_summary": report.get("stage_summary", {}),
+        "stage_summary_by_level": report.get("stage_summary_by_level", {}),
+    }
+    print(json.dumps(compact, ensure_ascii=False, indent=2))
+
+
+def _call_eval_func_with_top_k(func: Callable[..., dict], question: str, top_k: int) -> dict:
+    """
+    Call an ask/eval function. Prefer top_k keyword, fallback to question-only.
+    """
+    try:
+        return func(question, top_k=top_k)
+    except TypeError:
+        return func(question)
+
+
+def run_selected_hybrid_eval(
+    eval_cases: Sequence[dict],
+    ask_retrieval_func: Callable[..., dict],
+    ask_answer_func: Optional[Callable[..., dict]] = None,
+    n_per_level: int = 10,
+    seed: int = 42,
+    top_k: int = 10,
+    sleep_seconds: float = 0.0,
+    save_dir: Optional[str | Path] = None,
+    level_key: str = "difficulty",
+    run_answer: bool = True,
+) -> dict:
+    """
+    End-to-end helper for notebooks.
+
+    It samples n_per_level cases per difficulty, runs retrieval eval, optionally
+    runs answer eval, and returns stage-separated reports.
+
+    The notebook supplies the actual retrieval functions because Qdrant, Neo4j,
+    and LLM objects usually live inside notebook globals.
+    """
+    selected_cases = sample_cases_by_difficulty(
+        eval_cases=eval_cases,
+        n_per_level=n_per_level,
+        seed=seed,
+        level_key=level_key,
+    )
+
+    save_dir_path: Optional[Path] = Path(save_dir) if save_dir else None
+    if save_dir_path:
+        save_dir_path.mkdir(parents=True, exist_ok=True)
+
+    retrieval_save_path = save_dir_path / "hybrid_retrieval_results.json" if save_dir_path else None
+    answer_save_path = save_dir_path / "hybrid_answer_results.json" if save_dir_path else None
+    retrieval_report_path = save_dir_path / "hybrid_retrieval_report.json" if save_dir_path else None
+    answer_report_path = save_dir_path / "hybrid_answer_report.json" if save_dir_path else None
+
+    retrieval_results = run_graph_tests_for_eval(
+        selected_cases,
+        ask_graph_func=lambda q: _call_eval_func_with_top_k(ask_retrieval_func, q, top_k),
+        sleep_seconds=sleep_seconds,
+        save_path=retrieval_save_path,
+    )
+    retrieval_report = build_hybrid_metric_report(selected_cases, retrieval_results, k=top_k, level_key=level_key)
+
+    if retrieval_report_path:
+        save_json(retrieval_report, retrieval_report_path)
+
+    answer_results = None
+    answer_report = None
+
+    if run_answer and ask_answer_func is not None:
+        answer_results = run_answer_tests_for_eval(
+            selected_cases,
+            ask_graph_with_answer_func=lambda q: _call_eval_func_with_top_k(ask_answer_func, q, top_k),
+            sleep_seconds=sleep_seconds,
+            save_path=answer_save_path,
+        )
+        answer_report = build_hybrid_metric_report(selected_cases, answer_results, k=top_k, level_key=level_key)
+
+        if answer_report_path:
+            save_json(answer_report, answer_report_path)
+
+    return {
+        "selected_cases": selected_cases,
+        "selected_breakdown": sample_breakdown(selected_cases, level_key=level_key),
+        "retrieval_results": retrieval_results,
+        "retrieval_report": retrieval_report,
+        "answer_results": answer_results,
+        "answer_report": answer_report,
+        "metric_selection": selected_metric_definitions(k=top_k),
+        "save_dir": str(save_dir_path) if save_dir_path else None,
+    }
+
+
+EVALUATOR_VERSION = "qdrant_hybrid_ranking_v2"
