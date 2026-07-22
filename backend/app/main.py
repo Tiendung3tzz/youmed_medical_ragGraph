@@ -26,3 +26,10 @@ app.include_router(chat_router, prefix=settings.api_prefix)
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+@app.get("/debug/cors")
+def debug_cors():
+    return {
+        "frontend_origins": settings.frontend_origins,
+        "frontend_origins_list": settings.frontend_origins_list,
+    }
