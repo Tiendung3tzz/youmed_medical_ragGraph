@@ -13,3 +13,4 @@ qdrant-client>=1.11.0
 fastembed>=0.4.1
 sentence-transformers>=3.0.0
 torch>=2.0.0
+numpy
